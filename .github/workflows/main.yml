@@ -65,7 +65,7 @@ jobs:
           --------------------------------------
           🖥️ *Alamat* : $hostname
           👤 *Username* : RDP
-          🔑 *Password* : `$password`
+          🔑 *Password* : $password
           --------------------------------------
           Repositori: $repo_name
           "@
