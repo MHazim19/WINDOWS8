@@ -1,0 +1,134 @@
+name: RDP with Tailscale MagicDNS
+on:
+  workflow_dispatch:
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 3600 # <-- NILAI SUDAH DIPERBAIKI (Maksimal 6 jam)
+    steps:
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+      - name: Create RDP User with Fixed Password
+        shell: powershell
+        run: |
+          $password = "Qwe123!"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale_setup.exe"
+          Start-Process -FilePath ".\tailscale_setup.exe" -ArgumentList "/S" -Wait
+      - name: Remove Old Tailscale Device if Exists
+        shell: powershell
+        run: |
+          $tailnet = "${{ secrets.TAILSCALE_TAILNET }}"
+          $apiKey = "${{ secrets.TAILSCALE_API_KEY }}"
+          $targetHostname = "${{ github.event.repository.name }}".ToLower()
+          Write-Host "Mencari perangkat lama dengan nama '$targetHostname'..."
+          $headers = @{ "Authorization" = "Bearer $apiKey" }
+          $apiUrl = "https://api.tailscale.com/api/v2/tailnet/$tailnet/devices"
+          try {
+            $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
+            $devicesToDelete = $response.devices | Where-Object { $_.hostname -eq $targetHostname }
+            if ($null -ne $devicesToDelete) {
+                foreach ($device in $devicesToDelete) {
+                    $deviceId = $device.id
+                    Write-Host "Perangkat lama ditemukan dengan ID: $deviceId. Menghapus..."
+                    $deleteUrl = "https://api.tailscale.com/api/v2/device/$deviceId"
+                    Invoke-RestMethod -Method Delete -Uri $deleteUrl -Headers $headers
+                    Write-Host "Perangkat '$targetHostname' dengan ID '$deviceId' berhasil dihapus."
+                }
+            } else {
+                Write-Host "Tidak ada perangkat lama dengan nama '$targetHostname' yang ditemukan."
+            }
+          } catch {
+            Write-Error "Gagal menghubungi Tailscale API. Pastikan TAILSCALE_API_KEY dan TAILSCALE_TAILNET sudah benar. Error: $($_.Exception.Message)"
+            exit 1
+          }
+      - name: Establish Tailscale Connection
+        shell: powershell
+        run: |
+          $repo_name = "${{ github.event.repository.name }}".ToLower()
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$repo_name
+          $tsIP = $null
+          for ($i=0; $i -lt 12; $i++) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Getting Tailscale MagicDNS name..."
+          $statusJson = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json
+          $magicDns = ($statusJson | ConvertFrom-Json).Self.DNSName.TrimEnd('.')
+          if (-not $magicDns) { Write-Error "MagicDNS name not found."; exit 1 }
+          echo "MAGIC_DNS=$magicDns" >> $env:GITHUB_ENV
+          echo "### Detail Koneksi Tailscale" >> $env:GITHUB_STEP_SUMMARY
+          echo "**Alamat IP:** ` $	sIP `" >> $env:GITHUB_STEP_SUMMARY
+          echo "**MagicDNS:** ` $magicDns `" >> $env:GITHUB_STEP_SUMMARY
+      - name: Send Connection Details to Telegram
+        if: success()
+        shell: powershell
+        run: |
+          $bot_token = '${{ secrets.TELEGRAM_TOKEN }}'
+          $chat_id = '${{ secrets.TELEGRAM_CHAT_ID }}'
+          $password = $env:RDP_PASSWORD
+          $repo_name = "${{ github.repository }}"
+          $magic_dns = $env:MAGIC_DNS
+          $message = @"
+          *Sesi RDP Siap Digunakan*
+          --------------------------------------
+          *Alamat RDP* : $magic_dns
+          *Username* : RDP
+          *Password* : $password
+          --------------------------------------
+          Repositori: $repo_name
+          "@
+          $telegram_url = "https://api.telegram.org/bot$bot_token/sendMessage"
+          $body = @{ chat_id = $chat_id; text = $message; parse_mode = 'Markdown' } | ConvertTo-Json
+          Invoke-RestMethod -Uri $telegram_url -Method Post -Body $body -ContentType 'application/json; charset=utf-8'
+      - name: Maintain Connection & Send 5-Minute Warning
+        shell: powershell
+        run: |
+          $repo_name = "${{ github.event.repository.name }}"
+          Write-Host "Sesi RDP aktif. Detail koneksi telah dikirim ke Telegram."
+          Start-Sleep -Seconds 21300 # Sekitar 5 jam 55 menit
+          $bot_token = '${{ secrets.TELEGRAM_TOKEN }}'
+          $chat_id = '${{ secrets.TELEGRAM_CHAT_ID }}'
+          $telegram_send_url = "https://api.telegram.org/bot$bot_token/sendMessage"
+          $initial_message_text = "⚠️ *Windows $($repo_name.ToUpper()) sisa waktu 5 menit lagi, Segera persiapkan*"
+          $body_send = @{ chat_id = $chat_id; text = $initial_message_text; parse_mode = 'Markdown' } | ConvertTo-Json
+          try {
+              $send_response = Invoke-RestMethod -Uri $telegram_send_url -Method Post -Body $body_send -ContentType 'application/json' -ErrorAction Stop
+              $message_id = $send_response.result.message_id
+              Write-Host "Pesan awal berhasil dikirim. Message ID: $message_id"
+          } catch {
+              Write-Error "Gagal mengirim pesan awal. Error: $($_.Exception.Message)"; exit 1
+          }
+          Start-Sleep -Seconds 30
+          $telegram_edit_url = "https://api.telegram.org/bot$bot_token/editMessageText"
+          for ($i = 9; $i -ge 1; $i--) {
+              $seconds_remaining = $i * 30
+              $minutes = [Math]::Floor($seconds_remaining / 60)
+              $seconds = $seconds_remaining % 60
+              $time_text = if ($seconds -eq 0) { "$minutes menit" } else { "$minutes menit $seconds detik" }
+              $edit_message_text = "⚠️ *Windows $($repo_name.ToUpper()) sisa waktu $time_text lagi, Segera persiapkan*"
+              Write-Host "Mengedit pesan: sisa $time_text"
+              $body_edit = @{ chat_id = $chat_id; message_id = $message_id; text = $edit_message_text; parse_mode = 'Markdown' } | ConvertTo-Json
+              try {
+                  Invoke-RestMethod -Uri $telegram_edit_url -Method Post -Body $body_edit -ContentType 'application/json' -ErrorAction SilentlyContinue
+              } catch {
+                  Write-Warning "Gagal mengedit pesan. Error: $($_.Exception.Message)"
+              }
+              Start-Sleep -Seconds 30
+          }
+          Write-Host "Sesi RDP telah berakhir."
